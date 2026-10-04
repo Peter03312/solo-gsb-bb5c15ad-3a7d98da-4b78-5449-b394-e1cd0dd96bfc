@@ -9,6 +9,7 @@ from typing import Iterator
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import extensions
 from psycopg2.errors import UndefinedTable
 
 from . import audit
@@ -160,6 +161,37 @@ def transaction() -> Iterator:
         except Exception:
             conn.rollback()
             raise
+
+
+@contextmanager
+def read_transaction() -> Iterator:
+    """只读快照事务上下文：整个请求在同一张**一致性快照**上分次取数。
+
+    连接开启后立即把事务设为 ``REPEATABLE READ READ ONLY``：快照在事务首条
+    SQL 时固定，事务内读到的版本、节点、管段、运行水源与待修复事件必然
+    对应同一已提交时刻。整网重导 / 隔离提交 / 复供 / 水源切换若在请求
+    两次读取之间提交，本请求要么完全看到写入前、要么完全看到写入后，绝不
+    拼接不同提交时刻的阀位、水源与事件。
+
+    READ ONLY 是数据库对“只读接口绝不写入”的最后一道防线（只读请求误写
+    会直接报错而不是产生数据）。上下文正常结束时回滚释放快照（没有任何
+    变更需要提交），异常时同样回滚并原样抛出。
+    """
+    conn = psycopg2.connect(get_settings().database_url)
+    try:
+        # 必须在事务首条 SQL 之前设置：set_session 对随后开启的事务生效。
+        conn.set_session(
+            isolation_level=extensions.ISOLATION_LEVEL_REPEATABLE_READ,
+            readonly=True,
+            autocommit=False,
+        )
+        try:
+            yield conn
+        finally:
+            # 只读事务无变更可提交：回滚仅用于结束事务、释放一致性快照
+            conn.rollback()
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

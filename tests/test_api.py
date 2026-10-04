@@ -5,9 +5,11 @@
 运行：python3 -m unittest tests.test_api -v
 （需要 fastapi/httpx 依赖）
 """
+import copy
 import json
 import os
 import sys
+import threading
 import unittest
 from contextlib import contextmanager
 
@@ -44,6 +46,42 @@ STORE = FakeStore()
 @contextmanager
 def fake_get_conn():
     yield "FAKE_CONN"
+
+
+# 只读一致性视图：模拟 PostgreSQL REPEATABLE READ READ ONLY 事务。
+# 进入 fake_read_transaction 时冻结 STORE 的一份深拷贝（事务首条 SQL 定快照），
+# 期间其他线程/提交对 STORE 的改写对本事务不可见；各只读 db.* 替身优先读视图。
+_READ_VIEW = threading.local()
+
+
+def _current_view():
+    return getattr(_READ_VIEW, "view", None)
+
+
+def _capture_read_view():
+    """事务开始时固化 STORE 全量状态（深拷贝），等价于数据库一致性快照。"""
+    return {
+        "version": STORE.version,
+        "updated_at": STORE.updated_at,
+        "nodes": {k: Node(**v.__dict__) for k, v in STORE.nodes.items()},
+        "pipes": {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()},
+        "events": copy.deepcopy(STORE.events),
+        "snapshots": copy.deepcopy(STORE.snapshots),
+        "chains": copy.deepcopy(STORE.chains),
+        "anchor": copy.deepcopy(STORE.anchor),
+    }
+
+
+@contextmanager
+def fake_read_transaction():
+    """只读快照事务替身：事务内的所有读取只基于进入时刻冻结的视图。"""
+    prev = _current_view()
+    view = _capture_read_view()
+    _READ_VIEW.view = view
+    try:
+        yield "FAKE_READ_TX"
+    finally:
+        _READ_VIEW.view = prev
 
 
 @contextmanager
@@ -88,7 +126,22 @@ def fake_init_db():
 
 
 def fake_load_snapshot(conn, for_update=False):
-    return STORE.version, STORE.updated_at, dict(STORE.nodes), dict(STORE.pipes)
+    # for_update 只出现在写事务（无视图）；只读视图下返回事务开始时冻结的状态
+    if for_update or _current_view() is None:
+        src = STORE
+        return (
+            src.version,
+            src.updated_at,
+            {k: Node(**v.__dict__) for k, v in src.nodes.items()},
+            {k: Pipe(**v.__dict__) for k, v in src.pipes.items()},
+        )
+    view = _current_view()
+    return (
+        view["version"],
+        view["updated_at"],
+        {k: Node(**v.__dict__) for k, v in view["nodes"].items()},
+        {k: Pipe(**v.__dict__) for k, v in view["pipes"].items()},
+    )
 
 
 def fake_open_faults():
@@ -204,22 +257,29 @@ def fake_submit_isolation(conn, expected_version, fault_pipe_id, close_pipe_ids,
     }
 
 
+def _events_view(*, for_update=False):
+    """当前应读取的事件序列：只读视图内读冻结事件，写事务读全局 STORE。"""
+    view = None if for_update else _current_view()
+    return view["events"] if view is not None else STORE.events
+
+
 def fake_list_events(conn, limit):
-    # 与 db.list_events 一致：按事件编号倒序
-    return list(reversed(STORE.events))[:limit]
+    # 与 db.list_events 一致：按事件编号倒序；只读视图下读快照内事件
+    events = _events_view()
+    return [copy.deepcopy(e) for e in reversed(events)][:limit]
 
 
 def fake_get_event(conn, event_id, for_update=False):
-    for e in STORE.events:
+    for e in _events_view(for_update=for_update):
         if e["id"] == event_id:
-            return e
+            return copy.deepcopy(e)
     return None
 
 
 def fake_list_open_events(conn, exclude_event_id=None, for_update=False):
     return [
-        e
-        for e in STORE.events
+        copy.deepcopy(e)
+        for e in _events_view(for_update=for_update)
         if e.get("status", "open") == "open" and e["id"] != exclude_event_id
     ]
 
@@ -273,38 +333,56 @@ def fake_switch_sources(conn, expected_version, targets):
     return {"version": STORE.version, "snapshot_id": sid}
 
 
+def _snapshots_view():
+    """返回当前应读取的快照序列（只读视图内为其冻结快照，否则为全局 STORE）。"""
+    view = _current_view()
+    return view["snapshots"] if view is not None else STORE.snapshots
+
+
+def _chains_view():
+    view = _current_view()
+    return view["chains"] if view is not None else STORE.chains
+
+
+def _anchor_view():
+    view = _current_view()
+    return view["anchor"] if view is not None else STORE.anchor
+
+
 def fake_get_state_snapshot(conn, snapshot_id):
-    for s in STORE.snapshots:
+    for s in _snapshots_view():
         if s["id"] == snapshot_id:
-            return s
+            return copy.deepcopy(s)
     return None
 
 
 def fake_list_state_snapshots(conn, *, limit, after_id=None):
-    rows = [s for s in STORE.snapshots if after_id is None or s["id"] > after_id]
-    return rows[:limit]
+    rows = [s for s in _snapshots_view() if after_id is None or s["id"] > after_id]
+    return copy.deepcopy(rows[:limit])
 
 
 def fake_get_previous_state_snapshot(conn, snapshot_id):
-    previous = [s for s in STORE.snapshots if s["id"] < snapshot_id]
-    return previous[-1] if previous else None
+    previous = [s for s in _snapshots_view() if s["id"] < snapshot_id]
+    return copy.deepcopy(previous[-1]) if previous else None
 
 
 # ---- 快照摘要链（审计）替身 ----
 
 
 def fake_state_snapshot_exists(conn, snapshot_id):
-    return any(s["id"] == snapshot_id for s in STORE.snapshots)
+    return any(s["id"] == snapshot_id for s in _snapshots_view())
 
 
 def fake_list_snapshot_chain_rows(conn, start_id, end_id):
+    snapshots = _snapshots_view()
+    chains = _chains_view()
     rows = []
-    for s in sorted(STORE.snapshots, key=lambda r: r["id"]):
+    for s in sorted(snapshots, key=lambda r: r["id"]):
         if start_id <= s["id"] <= end_id:
-            chain = STORE.chains.get(s["id"])
+            chain = chains.get(s["id"])
             rows.append(
                 {
-                    **s,
+                    **copy.deepcopy(s),
                     "stored_digest": chain["digest"] if chain else None,
                     "stored_prev_digest": chain["prev_digest"] if chain else None,
                 }
@@ -313,13 +391,14 @@ def fake_list_snapshot_chain_rows(conn, start_id, end_id):
 
 
 def fake_get_chain_info(conn):
-    ids = [s["id"] for s in STORE.snapshots]
+    ids = [s["id"] for s in _snapshots_view()]
+    anchor = _anchor_view()
     return {
-        "anchor_snapshot_id": STORE.anchor["snapshot_id"] if STORE.anchor else None,
-        "anchor_kind": STORE.anchor["kind"] if STORE.anchor else None,
+        "anchor_snapshot_id": anchor["snapshot_id"] if anchor else None,
+        "anchor_kind": anchor["kind"] if anchor else None,
         "anchored_at": None,
         "snapshot_count": len(ids),
-        "chained_count": len(STORE.chains),
+        "chained_count": len(_chains_view()),
         "earliest_snapshot_id": min(ids) if ids else None,
         "latest_snapshot_id": max(ids) if ids else None,
     }
@@ -328,6 +407,7 @@ def fake_get_chain_info(conn):
 # 替换数据访问层
 db.get_conn = fake_get_conn
 db.transaction = fake_transaction
+db.read_transaction = fake_read_transaction
 db.init_db = fake_init_db
 db.load_snapshot = fake_load_snapshot
 db.replace_network = fake_replace_network
@@ -3323,6 +3403,595 @@ class SnapshotChainAuditTests(unittest.TestCase):
                     state=fake_freeze_current(),
                 )
         self.assertEqual(len(STORE.snapshots), len(STORE.chains))
+
+
+# ---------------------------------------------------------------- 只读一致性视图
+
+
+class ReadConsistencyTests(unittest.TestCase):
+    """单次只读请求必须只看到一个已提交时刻的完整视图（写入前或写入后）。
+
+    通过让请求的“第一次读取”后立刻模拟另一事务提交（改写 STORE），
+    验证请求的“第二次读取”仍从事务开始时冻结的视图取数，
+    而不是把旧阀位/旧事件与新版本拼接。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.chains = {}
+        STORE.anchor = None
+        STORE.fail_commit = False
+
+    def _import(self, network=VALID_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _install_first_read_commit(self, commit_once):
+        """在请求的首次 load_snapshot 之后、其它读取之前执行一次并发提交。
+
+        commit_once(pre_version) 直接改写全局 STORE，模拟另一事务已提交；
+        当前只读事务因视图已冻结而看不到它。返回还原函数。
+        """
+        original = db.load_snapshot
+        state = {"fired": False}
+
+        def patched(conn, for_update=False):
+            result = original(conn, for_update=for_update)
+            # 在首个只读读取后模拟并发提交；是否可见由读事务本身决定
+            # （一致性视图不可见 / 旧版逐条实时读则会看到，从而暴露拼接问题）。
+            if not state["fired"] and not for_update:
+                state["fired"] = True
+                commit_once(result[0])
+            return result
+
+        db.load_snapshot = patched
+
+        def restore():
+            db.load_snapshot = original
+
+        self.addCleanup(restore)
+        return restore
+
+    # ---------------------------------------------------------- 关阀建议
+
+    def test_recommend_sees_one_committed_state_despite_concurrent_submit(self):
+        self._import()  # 版本 1，无待修复故障
+        # 对 P5（B-U2）提建议时，模拟请求首读之后另一事务隔离了 P6（关 P4，v2）。
+        def commit_isolation(pre_version):
+            # 直接走既有替身：关 P4、版本 +1、写待修复事件（P6）
+            from app.planning import evaluate_plan
+
+            nodes = {k: Node(**v.__dict__) for k, v in STORE.nodes.items()}
+            pipes = {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()}
+            result = evaluate_plan(
+                nodes, pipes, "P6", ["P4"], for_submit=True,
+                pending_fault_pipe_ids=frozenset(),
+            )
+            self.assertTrue(result.isolatable)
+            fake_submit_isolation("FAKE_TX", pre_version, "P6", ["P4"], result)
+
+        self._install_first_read_commit(commit_isolation)
+
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P5", "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        # 视图冻结在 v1：建议与事件按同一提交时刻评估
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["version_match"])
+        self.assertEqual(body["recommended_close_pipe_ids"], ["P2"])
+        # v1（无 P6 故障）关 P2 会同时断 U2/U3；若错误混入 v2 的待修复事件，
+        # U3 已被 P4/P6 隔离，affected 只会是 ["U2"] —— 那将是跨提交拼接。
+        self.assertEqual(body["affected_sink_ids"], ["U2", "U3"])
+        # 并发提交确实落库（请求结束后读最新状态能看到 v2）
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 2)
+        self.assertTrue(next(p for p in net["pipes"] if p["id"] == "P4")["valve_closed"])
+
+    # ---------------------------------------------------------- 隔离预演
+
+    def test_preview_uses_snapshot_for_valves_and_open_faults(self):
+        # RESTORE_NETWORK：v2 隔离 P6（关 P4，事件 open）-> v3 复供（P4 重开）。
+        self.client.post("/api/network/import", json=RESTORE_NETWORK)
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.client.post(
+            "/api/isolation/events/1/restore", json={"version": 2}
+        )
+        self.assertEqual(STORE.version, 3)
+        self.assertFalse(STORE.pipes["P4"].valve_closed)
+
+        # 请求基于 v3 预演对 P5 关 P2；首读后模拟“重新隔离 P6（关 P4，v4）”提交。
+        def commit_reisolate(pre_version):
+            from app.planning import evaluate_plan
+
+            nodes = {k: Node(**v.__dict__) for k, v in STORE.nodes.items()}
+            pipes = {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()}
+            result = evaluate_plan(
+                nodes, pipes, "P6", ["P4"], for_submit=True,
+                pending_fault_pipe_ids=frozenset(),
+            )
+            self.assertTrue(result.isolatable)
+            fake_submit_isolation(
+                "FAKE_TX", pre_version, "P6", ["P4"], result
+            )
+
+        self._install_first_read_commit(commit_reisolate)
+
+        r = self.client.post(
+            "/api/isolation/preview",
+            json={"fault_pipe_id": "P5", "close_pipe_ids": ["P2"], "version": 3},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        # 完整写入前视图（v3：P4 开、无待修复故障）：关 P2 新增失供 U2/U3/U4
+        self.assertEqual(body["version"], 3)
+        self.assertTrue(body["version_match"])
+        self.assertTrue(body["isolatable"])
+        self.assertEqual(body["affected_sink_ids"], ["U2", "U3", "U4"])
+        # 若拼接“v3 阀位（P4 开）+ v4 待修复事件（P6 阻断）”，U3 经 P6 仍不可达，
+        # 会错误地只报 ['U2','U4'] —— 这正是要杜绝的跨提交拼接。
+
+    # ---------------------------------------------------------- 复供预演
+
+    def test_restore_preview_consistent_event_and_valves(self):
+        # 两条叠加故障（RESTORE_NETWORK），版本 3
+        r = self.client.post("/api/network/import", json=RESTORE_NETWORK)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P7", "close_pipe_ids": [], "version": 2},
+        )
+        self.assertEqual(STORE.version, 3)
+
+        # 对事件 1 复供预演时，首读后模拟事件 2 被复供（v4）：
+        # 若读到 v3 事件 + v4 故障集，会错误地把事件 1 判为 safe；
+        # 一致视图（v3）下 P7 仍待修复，重开 P4 -> D 端重新进水，safe=false。
+        def commit_inner_restore(pre_version):
+            fake_confirm_restore("FAKE_TX", 2, pre_version, [], [])
+
+        self._install_first_read_commit(commit_inner_restore)
+
+        r = self.client.post(
+            "/api/isolation/events/1/restore/preview", json={"version": 3}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 3)
+        self.assertFalse(body["safe"])
+        self.assertEqual(
+            [b["pipe_id"] for b in body["block_reasons"] if b["code"] == "FAULT_REWATER_RISK"],
+            ["P7"],
+        )
+
+    # ---------------------------------------------------------- 水源切换预演
+
+    def test_source_switch_preview_consistent_sources_and_faults(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)  # v1
+        # 停运 S2 -> v2；隔离 Q2（关 Q1）-> v3：S1 侧被 Q1 切断、S2 停运，
+        # 待修复故障 Q2 两端均不可达。
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": False}], "version": 1},
+        )
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "Q2", "close_pipe_ids": ["Q1"], "version": 2},
+        )
+        # 请求预演恢复 S2；首读后模拟“故障 Q2 被复供（事件 restored，v4）”提交。
+        def commit_clear_fault(pre_version):
+            # 该事件未关任何阀门（隔离时关的是 Q1，属另一事件），此处仅置 restored
+            fake_confirm_restore("FAKE_TX", 1, pre_version, [], [])
+
+        self._install_first_read_commit(commit_clear_fault)
+
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={"targets": [{"source_id": "S2", "running": True}], "version": 3},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        # 完整写入前视图（v3：Q2 仍待修复）：恢复 S2 会让 Q2 的 C 端重新进水
+        self.assertEqual(body["version"], 3)
+        self.assertFalse(body["safe"])
+        self.assertEqual(
+            [b["pipe_id"] for b in body["block_reasons"] if b["code"] == "FAULT_REWATER_RISK"],
+            ["Q2"],
+        )
+        # 若拼接“v3 水源（恢复 S2）+ v4 故障集（Q2 已复供、不再阻断）”，
+        # 会错误判为 safe=true 且 U1/U2 全部恢复 —— 跨提交拼接被杜绝。
+
+    # ---------------------------------------------------------- 流量核算 / 旁通
+
+    @staticmethod
+    def _delivery_body(version):
+        return {
+            "version": version,
+            "sources": [{"source_id": "S", "capacity": 1000}],
+            "pipes": [
+                {"pipe_id": pid, "capacity": 100}
+                for pid in ("P1", "P2", "P3", "P4", "P5", "P6")
+            ],
+            "demands": [
+                {"sink_id": "U1", "demand": 10},
+                {"sink_id": "U2", "demand": 10},
+                {"sink_id": "U3", "demand": 10},
+            ],
+        }
+
+    def test_delivery_evaluate_consistent_blocking_state(self):
+        self._import()  # v1，全部可交付 30
+        # 请求核算时首读后模拟隔离提交（关 P4，v2）：若阻断状态取到 v2 而
+        # 编号/版本取自 v1，会得到“当前版本 1 但 U3 被阻断只交付 20”的拼接结果。
+        def commit_isolation(pre_version):
+            from app.planning import evaluate_plan
+
+            nodes = {k: Node(**v.__dict__) for k, v in STORE.nodes.items()}
+            pipes = {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()}
+            result = evaluate_plan(
+                nodes, pipes, "P6", ["P4"], for_submit=True,
+                pending_fault_pipe_ids=frozenset(),
+            )
+            fake_submit_isolation("FAKE_TX", pre_version, "P6", ["P4"], result)
+
+        self._install_first_read_commit(commit_isolation)
+
+        r = self.client.post(
+            "/api/delivery/evaluate", json=self._delivery_body(1)
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        # 完整写入前视图：v1、30 全部可交付
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["version_match"])
+        self.assertEqual(body["max_delivered_total"], 30)
+        self.assertTrue(body["feasible"])
+        # 提交随后可见：重新（独立请求）按 v2 核算 -> U3 阻断，只交付 20
+        body2 = self._delivery_body(2)
+        r2 = self.client.post("/api/delivery/evaluate", json=body2)
+        self.assertEqual(r2.json()["max_delivered_total"], 20)
+
+    def test_bypass_baseline_consistent_with_faults(self):
+        # 旁通评估：基线与安全判定必须同一时刻。制造 v2（P6 待修复、P4 关）。
+        self._import()
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+
+        payload = self._delivery_body(2)
+        for d in payload["demands"]:
+            d["level"] = 1
+        payload["bypass"] = {"from": "B", "to": "D", "capacity": 100}
+
+        # 首读后模拟复供（P4 重开、事件 restored，v3）：v2 视图下旁通 B-D 会
+        # 绕过已关 P4 触及待修复 P6 的 D 端 -> safe=false；混入 v3 会误判安全。
+        def commit_restore(pre_version):
+            fake_confirm_restore("FAKE_TX", 1, pre_version, ["P4"], ["U3"])
+
+        self._install_first_read_commit(commit_restore)
+
+        r = self.client.post("/api/delivery/bypass", json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 2)
+        self.assertFalse(body["safe"])
+        self.assertIsNone(body["with_bypass"])
+        self.assertIsNone(body["deltas"])
+        self.assertEqual(
+            [b["pipe_id"] for b in body["block_reasons"] if b["code"] == "FAULT_REWATER_RISK"],
+            ["P6"],
+        )
+
+    # ---------------------------------------------------------- 读数核对
+
+    def test_reconcile_consistent_valves_sources_events(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)  # v1
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": False}], "version": 1},
+        )  # v2：S2 停运
+        body = {
+            "version": 2,
+            "sources": [
+                {"source_id": "S1", "injection": 2},
+                {"source_id": "S2", "injection": 2},  # v2 下停运源注入非 0 必须拒绝
+            ],
+            "sinks": [
+                {"sink_id": "U1", "withdrawal": 2},
+                {"sink_id": "U2", "withdrawal": 2},
+            ],
+            "pipes": [
+                {"pipe_id": pid, "capacity": 100, "reading": None}
+                for pid in ("Q1", "Q3", "Q2", "Q4")
+            ],
+        }
+        # 首读后模拟恢复 S2（v3）：若水源状态取自 v3、版本/阻断取自 v2，
+        # 停运源硬约束（STOPPED_SOURCE_INJECTION）会被漏掉 -> 错误放行。
+        def commit_restore_source(pre_version):
+            fake_switch_sources("FAKE_TX", pre_version, [("S2", True)])
+
+        self._install_first_read_commit(commit_restore_source)
+
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 2)
+        self.assertFalse(out["consistent"])
+        self.assertIn(
+            "STOPPED_SOURCE_INJECTION",
+            [reason["code"] for reason in out["reasons"]],
+        )
+
+    # ---------------------------------------------------------- 调度演练
+
+    def test_drill_empty_steps_echoes_single_committed_state(self):
+        self._import()  # v1
+        # 空步骤演练只回显起点状态；首读后模拟隔离提交（v2）。
+        def commit_isolation(pre_version):
+            from app.planning import evaluate_plan
+
+            nodes = {k: Node(**v.__dict__) for k, v in STORE.nodes.items()}
+            pipes = {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()}
+            result = evaluate_plan(
+                nodes, pipes, "P6", ["P4"], for_submit=True,
+                pending_fault_pipe_ids=frozenset(),
+            )
+            fake_submit_isolation("FAKE_TX", pre_version, "P6", ["P4"], result)
+
+        self._install_first_read_commit(commit_isolation)
+
+        r = self.client.post("/api/drill", json={"version": 1, "steps": []})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        # 完整写入前视图：v1、无待修复故障、所有阀开、U3 仍通水
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["final"]["open_faults"], [])
+        self.assertEqual(
+            body["final"]["supplied_sink_ids"], ["U1", "U2", "U3"]
+        )
+        self.assertFalse(
+            next(v for v in body["final"]["valves"] if v["pipe_id"] == "P4")["valve_closed"]
+        )
+
+    def test_drill_stale_version_conflict_remains_atomic(self):
+        self._import()  # v1
+        # 过期版本仍按既有 409 拒绝（不执行任何步骤）
+        r = self.client.post("/api/drill", json={"version": 99, "steps": []})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "VERSION_CONFLICT")
+
+    # ---------------------------------------------------------- 路由接线
+
+    def test_read_endpoints_open_read_transaction_and_write_endpoints_do_not(self):
+        # 读接口必须经 db.read_transaction（一致性视图）；
+        # 写接口仍用 db.transaction（锁最新状态原子复核）。
+        read_calls = {"n": 0}
+        write_calls = {"n": 0}
+        orig_read = db.read_transaction
+        orig_write = db.transaction
+
+        @contextmanager
+        def counting_read():
+            read_calls["n"] += 1
+            with orig_read() as conn:
+                yield conn
+
+        @contextmanager
+        def counting_write():
+            write_calls["n"] += 1
+            with orig_write() as conn:
+                yield conn
+
+        db.read_transaction = counting_read
+        db.transaction = counting_write
+        self.addCleanup(lambda: setattr(db, "read_transaction", orig_read))
+        self.addCleanup(lambda: setattr(db, "transaction", orig_write))
+
+        self._import()  # 写：1 次 write，0 次 read
+        self.assertEqual(write_calls["n"], 1)
+        self.assertEqual(read_calls["n"], 0)
+
+        self.client.get("/api/network")
+        self.assertEqual(read_calls["n"], 1)
+        self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 1},
+        )
+        self.assertEqual(read_calls["n"], 2)
+        self.client.post(
+            "/api/delivery/evaluate", json=self._delivery_body(1)
+        )
+        self.assertEqual(read_calls["n"], 3)
+
+        # 读接口绝不走写事务
+        self.assertEqual(write_calls["n"], 1)
+
+    # ---------------------------------------------------------- 并发：只读到完整视图
+
+    def test_writer_committing_between_two_reads_cannot_splice_response(self):
+        # 精确交错：让并发提交发生在请求“第一次读取之后、第二次读取之前”。
+        # 一致性快照下第二次读取仍取冻结视图 -> 完整 before；旧版逐条实时读
+        # 会取到写入后的阻断状态 -> version=1 却只交付 20 的矛盾拼接。
+        self._import()  # v1，干净态可交付 30
+
+        def commit_isolation(pre_version):
+            from app.planning import evaluate_plan
+
+            nodes = {k: Node(**v.__dict__) for k, v in STORE.nodes.items()}
+            pipes = {k: Pipe(**v.__dict__) for k, v in STORE.pipes.items()}
+            result = evaluate_plan(
+                nodes, pipes, "P6", ["P4"], for_submit=True,
+                pending_fault_pipe_ids=frozenset(),
+            )
+            fake_submit_isolation(
+                "FAKE_TX", pre_version, "P6", ["P4"], result
+            )
+
+        self._install_first_read_commit(commit_isolation)
+
+        r = self.client.post(
+            "/api/delivery/evaluate", json=self._delivery_body(1)
+        )
+        body = r.json()
+        # 完整写入前视图：version=1 与 可交付 30 必须同属一个时刻
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["version_match"])
+        self.assertEqual(body["max_delivered_total"], 30)
+
+    def test_concurrent_writer_and_many_readers_only_see_atomic_views(self):
+        # 真正的多线程压测：一个写线程反复 隔离(v偶数,20) <-> 复供(v奇数,30)，
+        # 多个只读线程同时核算。每个 (version, delivered) 都必须自洽：
+        # 奇版本=30、偶版本=20；任何矛盾对都说明发生了跨提交拼接。
+        self._import()  # v1
+        stop = threading.Event()
+        observations: list[tuple[int, int]] = []
+        obs_lock = threading.Lock()
+
+        def writer():
+            while not stop.is_set():
+                net = self.client.get("/api/network").json()
+                version = net["version"]
+                p4_closed = next(
+                    p for p in net["pipes"] if p["id"] == "P4"
+                )["valve_closed"]
+                if not p4_closed:
+                    st, _ = self._submit_raw(version, "P6", ["P4"])
+                else:
+                    st, _ = self._restore_open(version)
+                # 409：与读者不写无关；写线程之间只有一个，故预期 200，遇 409 忽略
+                self.assertIn(st, (200, 409))
+
+        def reader():
+            for _ in range(60):
+                if stop.is_set():
+                    break
+                body = self.client.post(
+                    "/api/delivery/evaluate", json=self._delivery_body(0)
+                ).json()
+                with obs_lock:
+                    observations.append(
+                        (body["version"], body["max_delivered_total"])
+                    )
+
+        threads = [threading.Thread(target=writer)]
+        threads += [threading.Thread(target=reader) for _ in range(4)]
+        for t in threads:
+            t.start()
+        stop.wait(1.2)
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertGreater(len(observations), 20)
+        versions_seen = {v for v, _d in observations}
+        self.assertGreaterEqual(len(versions_seen), 3)
+        # 每个版本只能观测到与其状态一致的唯一交付量
+        delivered_by_version: dict[int, set[int]] = {}
+        for version, delivered in observations:
+            delivered_by_version.setdefault(version, set()).add(delivered)
+            expected = 30 if version % 2 == 1 else 20
+            self.assertEqual(
+                delivered, expected,
+                f"跨提交拼接：版本 {version} 却观测到交付 {delivered}（期望 {expected}）",
+            )
+
+    def _submit_raw(self, version, fault_pipe_id, close_pipe_ids):
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": fault_pipe_id,
+                  "close_pipe_ids": close_pipe_ids, "version": version},
+        )
+        return r.status_code, r.json() if r.status_code == 200 else None
+
+    def _restore_open(self, version):
+        events = self.client.get("/api/isolation/events").json()
+        open_event = next(e for e in events if e["status"] == "open")
+        r = self.client.post(
+            f"/api/isolation/events/{open_event['id']}/restore",
+            json={"version": version},
+        )
+        return r.status_code, r.json() if r.status_code == 200 else None
+
+
+# 真实 PostgreSQL 的快照隔离集成测试：仅在显式提供 DATABASE_URL 且可连时运行。
+# CI / docker compose 环境可用 RUN_DB_TESTS=1 开启；本机无 PG 时自动跳过。
+@unittest.skipUnless(
+    os.environ.get("RUN_DB_TESTS") == "1",
+    "需要真实 PostgreSQL：设置 RUN_DB_TESTS=1 且 DATABASE_URL 可连时运行",
+)
+class ReadConsistencyPostgresTests(unittest.TestCase):
+    """在真实 PostgreSQL 上验证 REPEATABLE READ READ ONLY 读事务的跨提交稳定性。"""
+
+    def setUp(self):
+        from app import db as real_db
+
+        self.db = real_db
+        with real_db.transaction() as conn:
+            real_db.replace_network(
+                conn,
+                [Node(id="S", type="source"), Node(id="U", type="sink")],
+                [Pipe(id="P1", from_node="S", to_node="U", has_valve=True)],
+            )
+
+    def _import_two_node_network(self):
+        pass
+
+    def test_reader_keeps_old_snapshot_across_concurrent_commit(self):
+        import psycopg2
+
+        from app.config import get_settings
+
+        # 读者：开启只读快照事务，先读版本（固定快照为 v1）
+        read_conn = psycopg2.connect(get_settings().database_url)
+        read_conn.set_session(
+            isolation_level=self.db.extensions.ISOLATION_LEVEL_REPEATABLE_READ,
+            readonly=True,
+        )
+        try:
+            with read_conn.cursor() as cur:
+                cur.execute("SELECT version FROM network_meta WHERE id=1")
+                self.assertEqual(cur.fetchone()[0], 1)
+
+            # 另一连接提交一次水源停运（v2）
+            with self.db.transaction() as conn:
+                self.db.switch_sources(conn, expected_version=1, targets=[("S", False)])
+
+            # 读者仍看到 v1 与停运前的 running=true（写入前完整视图）
+            with read_conn.cursor() as cur:
+                cur.execute("SELECT version FROM network_meta WHERE id=1")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute("SELECT running FROM nodes WHERE id='S'")
+                self.assertTrue(cur.fetchone()[0])
+        finally:
+            read_conn.rollback()
+            read_conn.close()
+
+        # 新读事务看到写入后完整视图（v2、running=false）
+        with self.db.read_transaction() as conn:
+            version, _ts, nodes, _pipes = self.db.load_snapshot(conn)
+            self.assertEqual(version, 2)
+            self.assertFalse(nodes["S"].running)
 
 
 if __name__ == "__main__":
