@@ -32,6 +32,16 @@
 判为**不可用**并返回故障编号与危险端点，不输出旁通交付量；
 安全时返回基线与接入旁通后的各等级、各用水点交付量及差值，全程只读。
 
+**只读请求一致性快照**：关阀建议、隔离/复供/水源切换预演、流量核算与分档交付、
+临时旁通评估、读数核对、调度演练（以及读网、历史、快照与审计查询）的**单次请求**
+在数据库侧使用 **REPEATABLE READ 只读事务**：版本、节点（含水源运行状态）、
+管段阀位、待修复事件在同一事务快照内一次取齐，**只对应同一已提交时刻**；
+整网重导、隔离提交、复供或水源切换即使在该请求的多条读取之间提交，结果也只能是
+**写入前或写入后的完整视图**，绝不跨提交拼接而误判隔离安全或交付量。只读事务不阻塞
+并发写入；过期版本仍沿用各接口既有的 `version_match=false` / `409 VERSION_CONFLICT`
+处理，确认类操作（隔离提交、复供确认、水源切换确认）仍在写事务内锁版本行按
+**最新状态原子复核**，契约不变。
+
 > 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
 > 流量核算、分档交付、调度演练、临时旁通评估）只以**运行中**的水源为供水起点；停运水源不再供水。
 
@@ -126,6 +136,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   返回 `feasible=false` 并在 `reason` 中给出原因，**不改任何状态**；
 - 建议的提交仍走现有 `POST /api/isolation/submit`，按最新状态复核；
   版本过期沿用 `409 VERSION_CONFLICT` 冲突处理（重新建议后再提交即可）。
+- 建议请求在 **REPEATABLE READ 只读事务**内一次取齐版本/阀位/运行水源/待修复事件：
+  即使并发提交发生在请求读取期间，返回内容也只对应写入前或写入后的同一完整状态。
 
 **复供判定**（操作员按 `事件编号 + 当前版本` 操作；复供图 = 重开该事件阀门，其他待修复故障管段继续移除）：
 
@@ -141,6 +153,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 复供明确拒绝（均不产生部分变更）：
   版本过期 `409 VERSION_CONFLICT`、事件不存在 `404 EVENT_NOT_FOUND`、
   事件已复供 `409 EVENT_ALREADY_RESTORED`、重新进水风险 `422 RESTORE_UNSAFE`。
+- 复供预演的单次请求在同一 REPEATABLE READ 只读快照内读取事件行、阀位、
+  运行水源与其余待修复事件；事件不存在/已复供的判定同样基于该完整快照，
+  不会因并发复供读到“半新半旧”的事件与阀位。
 
 **水源状态切换**（`POST /api/sources/switch/preview` 只读预演、`POST /api/sources/switch` 原子确认）：
 
@@ -165,6 +180,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   同批编号重复 `SOURCE_TARGET_DUPLICATE`（确认时统一为 `422 SOURCE_SWITCH_INVALID`，
   明细在 `issues`；预演不拒绝，返回 200 并在 `issues` 中列出）、
   重新进水风险 `422 SOURCE_SWITCH_UNSAFE`。
+- 水源切换**预演**的单次请求在同一 REPEATABLE READ 只读快照内取齐版本、
+  全部水源运行状态、阀位与待修复事件，失供/恢复与重新进水风险均基于该
+  完整状态计算；确认仍在写事务内锁版本行按最新状态原子复核。
 
 **流量核算**（`POST /api/delivery/evaluate`，**只读**，不改阀位/事件/版本/快照）：
 
@@ -189,6 +207,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   **最大可交付总量** `max_delivered_total` 与**能否全部满足** `feasible`
   （`feasible = max_delivered_total == total_demand`）；
   过期版本**不拒绝**：仍按当前状态核算，仅 `version_match=false`（与预演类接口一致）。
+- 单次核算在 REPEATABLE READ 只读事务内取齐版本/运行水源/阀位/待修复事件，
+  编号覆盖校验与通水口径基于同一完整快照，并发写入不会把旧阀位与新事件拼接。
 
 **保障等级分档交付**（`POST /api/delivery/allocate`，**只读**，不改阀位/事件/版本/快照；
 与现有 `/api/delivery/evaluate` 并存、互不影响）：
@@ -246,6 +266,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   阻断管段或容量 0 的管段缺报时恒返回 `min_flow=max_flow=0`；已申报读数不在补值
   列表中返回。
 - 过期版本**不拒绝**：仍按当前状态计算，仅 `version_match=false`。
+- 单次核对在 REPEATABLE READ 只读事务内取齐版本/水源运行状态/阀位/待修复事件，
+  停运注入、阻断管段、节点平衡与容量四条硬约束基于同一完整快照，不会把并发
+  切换的水源状态与旧阀位混在一组平衡式里。
 - 该接口为纯只读新增，**原有流量核算接口 `/api/delivery/evaluate` 的语义与返回
   保持不变**（内部新增可复用的 Dinic 类，既有 `_undirected_max_flow` 未改动）。
 
@@ -261,6 +284,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - **版本过期整体拒绝**：`version` 不等于当前版本时返回
   `409 VERSION_CONFLICT`（响应体含当前版本 `current_version`），不执行任何步骤；
   这与提交类接口一致——演练是对一串**提交**的预检。
+- 演练起点状态（版本/阀位/运行水源/现存事件）在同一 REPEATABLE READ 只读快照内
+  一次取齐：并发提交只可能让整次演练基于写前或写后的完整状态，步骤推演不会
+  从不同提交时刻各取一部分。
 - 以当前状态为起点，在**状态副本**上逐步套用与既有提交接口**完全一致**的校验：
   隔离按提交口径（`for_submit`：故障两端须均可隔离、已关闭阀门不得重复关闭、
   无阀管段不可关等）；复供与恢复水源不得使任一**待修复**故障管段端点重新进水；
@@ -375,7 +401,46 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   已入链快照数与最早/最晚编号，供审计员选取核验边界；
 - **现有快照查询接口的字段与含义保持不变**，摘要链信息只通过审计接口暴露。
 
+**只读请求一致性快照（单次请求同一已提交状态）**：
+
+- 背景：一次只读计算（如关阀建议、隔离安全判定、交付量核算）需要同时读取
+  **版本**、**节点**（含运行水源）、**管段**（阀位）与**待修复事件**四类数据；
+  连接默认 READ COMMITTED 时每条 `SELECT` 各取一份快照，若整网重导、隔离提交、
+  复供确认或水源切换恰好在同一请求的两次读取之间提交，就会把不同提交时刻的
+  阀位、水源与事件拼成“混合视图”，进而误判隔离安全（如漏算新提交的待修复故障）
+  或交付量（如按旧阀位配新事件）。
+- 实现：下列只读接口的单次请求统一在 **`REPEATABLE READ` `READ ONLY` 事务**中
+  完成全部读取——事务快照在首条查询时固定，请求内返回的版本、节点、管段、
+  运行水源与待修复事件**必对应同一提交时刻**；并发写入时结果只能是
+  **写入前的完整视图**或**写入后的完整视图**，不会出现跨时刻拼接：
+  - `GET /api/network`（读网）
+  - `POST /api/isolation/recommend`（关阀建议）
+  - `POST /api/isolation/preview`（隔离预演）
+  - `POST /api/isolation/events/{id}/restore/preview`（复供预演）
+  - `POST /api/sources/switch/preview`（水源切换预演）
+  - `POST /api/delivery/evaluate`、`/api/delivery/allocate`、`/api/delivery/bypass`
+    （流量核算、分档交付、旁通评估）
+  - `POST /api/meters/reconcile`（读数核对）
+  - `POST /api/drill`（调度演练）
+  - 以及 `GET /api/isolation/events`、`/api/snapshots*`、`/api/audit/*` 等只读查询。
+- 只读事务**不获取写锁、不阻塞**整网重导/隔离/复供/水源切换等并发写入，自身也
+  只读不写；事务快照在响应返回后释放。
+- **沿用各接口已有输入输出与过期版本处理**：响应中的 `version` 为该快照对应的
+  当前版本；预演/核算/旁通/核对类接口对过期版本仍返回 200 且 `version_match=false`
+  （但本次计算内部不会再混入其他时刻的数据），调度演练与确认类接口对过期版本仍为
+  `409 VERSION_CONFLICT`；复供预演对**事件不存在 / 已复供**仍分别返回
+  `404 EVENT_NOT_FOUND` / `409 EVENT_ALREADY_RESTORED`。
+- **确认操作契约不变**：隔离提交、复供确认、水源切换确认仍在写事务内锁定版本行
+  （复供另锁事件行）按**最新已提交状态原子复核**版本与安全性后才生效；
+  只读一致性快照只保证“看到的是某个完整状态”，不替代提交时的乐观并发复核。
+
 ## 五、HTTP API
+
+> 除 `POST /api/network/import`、`/api/isolation/submit`、
+> `/api/isolation/events/{id}/restore`、`/api/sources/switch` 四个写接口外，
+> 其余接口均为只读，且**单次请求在 REPEATABLE READ READ ONLY 事务中基于同一
+> 已提交状态**返回版本/节点/管段/运行水源/待修复事件（详见第四节“只读请求
+> 一致性快照”）；写接口的输入输出与原子复核契约保持不变。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -1156,6 +1221,8 @@ curl -s -X POST http://localhost:8000/api/delivery/allocate \
   仍按当前状态核算，仅 `version_match=false`。
 - 该接口为**只读新增**：现有 `/api/delivery/evaluate` 的输入输出与含义
   **保持不变**（无 `level` 字段、仍只返回总量口径）。
+- 单次分档核算在 REPEATABLE READ 只读事务内取齐版本/运行水源/阀位/待修复事件，
+  等级总量与逐点交付优化全程基于同一完整快照。
 
 保障等级分档交付全流程演示脚本（标准库实现，全程只读）：
 
@@ -1499,6 +1566,8 @@ curl -s -X POST http://localhost:8000/api/delivery/bypass \
   判不可用时 `with_bypass` / `deltas` 恒为 `null`，`baseline` 仍给出。
 - 旁通管只在内存中接入评估：评估后版本、阀位、事件、快照与管网均不变，
   管网中不会出现虚拟旁通管段；用过期版本调用不报错，仅 `version_match=false`。
+- 基线核算、编号覆盖校验与旁通接入后的拓扑安全判定在同一 REPEATABLE READ
+  只读快照内完成：不会出现“基线按旧阀位、安全判定按新待修复事件”的拼接。
 
 临时旁通管评估全流程演示脚本（标准库实现，全程只读）：
 
@@ -1556,6 +1625,20 @@ python3 examples/bypass_demo.py
 python3 examples/bypass_demo.py http://localhost:8000
 ```
 
+只读一致性快照演示（标准库实现，只读 + 并发写入观察写入前/写入后两个完整视图）：
+
+```bash
+python3 examples/consistent_read_demo.py
+# 或指定地址：
+python3 examples/consistent_read_demo.py http://localhost:8000
+```
+
+脚本依次演示：写前完整视图（建议/预演/流量核算/读数核对版本互相对应）→
+另一会话并发提交隔离不影响只读请求 → 写后完整视图（空建议、U3 断供、交付量变化）→
+过期版本沿用 `version_match=false` / `409 VERSION_CONFLICT` →
+复供预演沿用 `404 EVENT_NOT_FOUND` / `409 EVENT_ALREADY_RESTORED` →
+确认只读全程未改写状态。
+
 ## 七、测试
 
 核心图算法与校验逻辑（`tests/test_planning.py`，114 个用例）与快照摘要链
@@ -1581,7 +1664,7 @@ app/
   schemas.py      # Pydantic 请求/响应模型
   planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、临时旁通管评估(内存接入旁通的基线/交付对照与重新进水判定)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照
   audit.py        # 快照 SHA-256 摘要链：固定可复现编码、创世摘要、只读区间核验(内容损坏/链路断裂/边界不符定位)
-  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/同事务接链、首次启用补建链与起点元数据、旧库上线基线、审计区间只读查询、历史
+  db.py           # PostgreSQL：DDL/迁移、快照、只读一致性视图(REPEATABLE READ READ ONLY)、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/同事务接链、首次启用补建链与起点元数据、旧库上线基线、审计区间只读查询、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
@@ -1597,6 +1680,7 @@ examples/
   meter_reconcile_demo.py # 管段流量计读数核对全流程示例（只读：一致性、缺报范围、停运/关阀/故障硬约束、422）
   drill_demo.py           # 调度演练全流程示例（只读：有序步骤逐步预检、临时事件引用、首败即停、409/只读核对）
   bypass_demo.py          # 临时旁通管评估全流程示例（只读：基线/旁通交付对照与差值、重新进水判不可用、并联、422）
+  consistent_read_demo.py # 只读一致性快照示例（只读请求同一已提交状态；并发写入只呈现写前/写后完整视图）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
   audit_chain_demo.py     # 快照摘要链核验示例（只读：链信息/区间核验/边界不符/缺端点/倒序/摘要格式）
 tests/

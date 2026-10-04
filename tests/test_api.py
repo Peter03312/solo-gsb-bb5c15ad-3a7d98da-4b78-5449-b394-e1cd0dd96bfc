@@ -83,6 +83,60 @@ def fake_transaction():
         raise
 
 
+class _ReadSnapshot:
+    """模拟 PostgreSQL REPEATABLE READ 只读事务：进入时固定一份已提交快照。
+
+    块内对 load_snapshot / list_open_events / get_event 的读取都落到进入
+    时刻冻结的版本/节点/管段/事件上；即使另一个“事务”在两次读取之间
+    改写 STORE，块内仍只看到写前的完整视图，绝不跨提交拼接。
+    """
+
+    def __init__(self):
+        import copy
+
+        self.version = STORE.version
+        self.updated_at = STORE.updated_at
+        self.nodes = {k: copy.deepcopy(v) for k, v in STORE.nodes.items()}
+        self.pipes = {k: copy.deepcopy(v) for k, v in STORE.pipes.items()}
+        self.events = copy.deepcopy(STORE.events)
+
+
+@contextmanager
+def fake_consistent_read():
+    # 与 db.consistent_read 对齐：产出一个连接句柄，读取经快照替身固定
+    snap = _ReadSnapshot()
+
+    def snap_load_snapshot(conn, for_update=False):
+        return (
+            snap.version,
+            snap.updated_at,
+            {k: Node(**v.__dict__) for k, v in snap.nodes.items()},
+            {k: Pipe(**v.__dict__) for k, v in snap.pipes.items()},
+        )
+
+    def snap_list_open_events(conn, exclude_event_id=None, for_update=False):
+        return [
+            dict(e)
+            for e in snap.events
+            if e.get("status", "open") == "open" and e["id"] != exclude_event_id
+        ]
+
+    def snap_get_event(conn, event_id, for_update=False):
+        for e in snap.events:
+            if e["id"] == event_id:
+                return dict(e)
+        return None
+
+    orig = (db.load_snapshot, db.list_open_events, db.get_event)
+    db.load_snapshot = snap_load_snapshot
+    db.list_open_events = snap_list_open_events
+    db.get_event = snap_get_event
+    try:
+        yield "FAKE_CONSISTENT_READ"
+    finally:
+        db.load_snapshot, db.list_open_events, db.get_event = orig
+
+
 def fake_init_db():
     return None
 
@@ -328,6 +382,7 @@ def fake_get_chain_info(conn):
 # 替换数据访问层
 db.get_conn = fake_get_conn
 db.transaction = fake_transaction
+db.consistent_read = fake_consistent_read
 db.init_db = fake_init_db
 db.load_snapshot = fake_load_snapshot
 db.replace_network = fake_replace_network
@@ -3323,6 +3378,311 @@ class SnapshotChainAuditTests(unittest.TestCase):
                     state=fake_freeze_current(),
                 )
         self.assertEqual(len(STORE.snapshots), len(STORE.chains))
+
+
+class ConsistentReadApiTests(unittest.TestCase):
+    """只读接口一致性快照测试：一次请求只基于同一已提交状态。
+
+    模拟“整网重导/隔离提交/复供/水源切换在一次只读请求的多条读取之间
+    提交”：钩子在进入一致性视图后的第一次 load_snapshot 之后改写 STORE，
+    随后的 list_open_events/get_event 必须仍读到进入时刻冻结的完整视图，
+    返回的版本、阀位、运行水源、待修复事件对应同一时刻。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.chains = {}
+        STORE.anchor = None
+        STORE.fail_commit = False
+        self._installed = []
+
+    def tearDown(self):
+        for name, fn in self._installed:
+            setattr(db, name, fn)
+        self._installed.clear()
+
+    def _import(self, network=VALID_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _mutate_after_first_read(self, mutate):
+        """在一致性视图首次 load_snapshot 后、后续读取前执行 mutate()。
+
+        真实环境对应另一个事务在两条 SELECT 之间提交；替身的 REPEATABLE
+        READ 视图已固定进入快照，后续 list_open_events 等不应看到改动。
+        """
+        state = {"done": False}
+        original = db.load_snapshot
+
+        def hooked(conn, for_update=False):
+            result = original(conn, for_update=for_update)
+            if not state["done"] and conn == "FAKE_CONSISTENT_READ":
+                state["done"] = True
+                mutate()
+            return result
+
+        self._installed.append(("load_snapshot", original))
+        db.load_snapshot = hooked
+
+    def test_consistent_read_view_freeze_unit(self):
+        self._import()
+        with db.consistent_read() as conn:
+            v1 = db.load_snapshot(conn)[0]
+            # 视图内改版本/事件不影响已固定的只读快照
+            STORE.version = 99
+            STORE.events.append({"id": 1, "fault_pipe_id": "P6",
+                                 "status": "open", "closed_pipe_ids": []})
+            self.assertEqual(db.load_snapshot(conn)[0], v1)
+            self.assertEqual(db.list_open_events(conn), [])
+        # 退出视图后读取恢复实时数据
+        self.assertEqual(db.load_snapshot("FAKE_CONN")[0], 99)
+        STORE.version = 1
+
+    def test_recommend_not_spliced_with_concurrent_isolation_submit(self):
+        self._import()
+
+        def mutate():
+            # 并发事务：关 P4 隔离 P6，版本 -> 2，新增待修复事件
+            p = STORE.pipes["P4"]
+            STORE.pipes["P4"] = Pipe(p.id, p.from_node, p.to_node,
+                                    p.has_valve, True, p.name)
+            import datetime
+            STORE.events.append({
+                "id": 1, "version_before": 1, "version_after": 2,
+                "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"],
+                "affected_sink_ids": ["U3"], "status": "open",
+                "restored_at": None,
+                "created_at": datetime.datetime(2026, 9, 30, 12, 0, 0),
+            })
+            STORE.version = 2
+
+        self._mutate_after_first_read(mutate)
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        # 写前完整视图：版本仍为 1、P4 尚未关闭、无待修复事件 -> 建议关 P4
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["version_match"])
+        self.assertTrue(out["feasible"])
+        self.assertEqual(out["recommended_close_pipe_ids"], ["P4"])
+        self.assertEqual(out["affected_sink_ids"], ["U3"])
+
+    def test_preview_not_spliced_with_concurrent_restore(self):
+        # 已隔离 P6（关 P4，事件 1 open，版本 2）；请求期间并发复供事件 1
+        info = self._import()
+        self.assertEqual(info["version"], 1)
+        sub = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(sub.status_code, 200, sub.text)
+
+        def mutate():
+            p = STORE.pipes["P4"]
+            STORE.pipes["P4"] = Pipe(p.id, p.from_node, p.to_node,
+                                    p.has_valve, False, p.name)
+            STORE.events[0]["status"] = "restored"
+            STORE.version = 3
+
+        self._mutate_after_first_read(mutate)
+        # 对事件 1 的复供预演：视图固定在写前（事件仍 open、P4 仍关）
+        r = self.client.post(
+            "/api/isolation/events/1/restore/preview",
+            json={"version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 2)
+        self.assertEqual(out["status"], "open")
+        self.assertEqual(out["closed_pipe_ids"], ["P4"])
+        self.assertCountEqual(out["restored_sink_ids"], ["U3"])
+
+    def test_restore_preview_missing_event_error_unchanged(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/events/999/restore/preview", json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "EVENT_NOT_FOUND")
+        # 先制造一条已复供事件，再复供沿用既有 409
+        sub = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(sub.status_code, 200, sub.text)
+        self.client.post(
+            "/api/isolation/events/1/restore", json={"version": 2}
+        )
+        r = self.client.post(
+            "/api/isolation/events/1/restore/preview", json={"version": 3}
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "EVENT_ALREADY_RESTORED")
+
+    def test_source_switch_preview_not_spliced(self):
+        self._import(TWO_SOURCE_NETWORK)
+
+        def mutate():
+            # 并发事务停运 S1（版本 2）
+            n = STORE.nodes["S1"]
+            STORE.nodes["S1"] = Node(n.id, n.type, n.name, False)
+            STORE.version = 2
+
+        self._mutate_after_first_read(mutate)
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={"targets": [{"source_id": "S2", "running": False}],
+                  "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        # 写前完整视图：版本 1、两座水源均运行；停运 S2 后 U1/U2 仍由 S1 顶供
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["version_match"])
+        self.assertTrue(out["changed"])
+        self.assertEqual(out["affected_sink_ids"], [])
+
+    def test_delivery_evaluate_not_spliced(self):
+        self._import()
+
+        def mutate():
+            # 并发整网重导：版本重置为 1，节点/管段全部清空
+            STORE.nodes = {}
+            STORE.pipes = {}
+            STORE.events = []
+            STORE.version = 1
+
+        self._mutate_after_first_read(mutate)
+        # 若读到写前网络+写后空事件（或反之）会拼接；写前视图应正常核算
+        r = self.client.post(
+            "/api/delivery/evaluate",
+            json=_delivery_body(version=1),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["version_match"])
+        self.assertEqual(out["max_delivered_total"], 3)
+        self.assertTrue(out["feasible"])
+
+    def test_reconcile_not_spliced_with_concurrent_submit(self):
+        self._import()
+
+        def mutate():
+            # 并发隔离提交：P4 关闭 + 新待修复事件 P6，版本 2
+            p = STORE.pipes["P4"]
+            STORE.pipes["P4"] = Pipe(p.id, p.from_node, p.to_node,
+                                    p.has_valve, True, p.name)
+            import datetime
+            STORE.events.append({
+                "id": 1, "version_before": 1, "version_after": 2,
+                "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"],
+                "affected_sink_ids": ["U3"], "status": "open",
+                "restored_at": None,
+                "created_at": datetime.datetime(2026, 9, 30, 12, 0, 0),
+            })
+            STORE.version = 2
+
+        self._mutate_after_first_read(mutate)
+        body = {
+            "version": 1,
+            "sources": [{"source_id": "S", "injection": 3}],
+            "sinks": [{"sink_id": s, "withdrawal": 1}
+                      for s in ("U1", "U2", "U3")],
+            "pipes": [{"pipe_id": p, "capacity": 100, "reading": None}
+                      for p in ("P1", "P2", "P3", "P4", "P5", "P6")],
+        }
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        # 写前视图：版本 1、P4/P6 均不阻断，平衡有可行解且缺报可确定
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["consistent"])
+        flows = {x["pipe_id"]: (x["min_flow"], x["max_flow"])
+                 for x in out["readings"]}
+        # 树形网：P2 承担 U2+U3=2，P4 只承担 U3=1，P6=1
+        self.assertEqual(flows["P2"], (2, 2))
+        self.assertEqual(flows["P4"], (1, 1))
+        self.assertEqual(flows["P6"], (1, 1))
+
+    def test_drill_not_spliced_with_concurrent_submit(self):
+        self._import(RESTORE_NETWORK)
+
+        def mutate():
+            # 并发提交把 P4 关闭并产生事件 1（P6），版本 2
+            p = STORE.pipes["P4"]
+            STORE.pipes["P4"] = Pipe(p.id, p.from_node, p.to_node,
+                                    p.has_valve, True, p.name)
+            import datetime
+            STORE.events.append({
+                "id": 1, "version_before": 1, "version_after": 2,
+                "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"],
+                "affected_sink_ids": ["U3", "U4"], "status": "open",
+                "restored_at": None,
+                "created_at": datetime.datetime(2026, 9, 30, 12, 0, 0),
+            })
+            STORE.version = 2
+
+        self._mutate_after_first_read(mutate)
+        # 演练第 1 步隔离 P6 关 P4：写前视图里 P4 仍开，可隔离、U3/U4 失供
+        r = self.client.post("/api/drill", json={
+            "version": 1,
+            "steps": [{"type": "isolation", "fault_pipe_id": "P6",
+                       "close_pipe_ids": ["P4"]}],
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["steps"][0]["affected_sink_ids"], ["U3", "U4"])
+
+    def test_bypass_not_spliced_with_concurrent_submit(self):
+        self._import()
+
+        def mutate():
+            # 并发隔离 P6（关 P4）：写后视图下旁通 A->D 会给故障 P6 重新进水
+            p = STORE.pipes["P4"]
+            STORE.pipes["P4"] = Pipe(p.id, p.from_node, p.to_node,
+                                    p.has_valve, True, p.name)
+            import datetime
+            STORE.events.append({
+                "id": 1, "version_before": 1, "version_after": 2,
+                "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"],
+                "affected_sink_ids": ["U3"], "status": "open",
+                "restored_at": None,
+                "created_at": datetime.datetime(2026, 9, 30, 12, 0, 0),
+            })
+            STORE.version = 2
+
+        self._mutate_after_first_read(mutate)
+        body = dict(_delivery_body(version=1))
+        body["bypass"] = {"from": "A", "to": "D", "capacity": 50}
+        body["demands"] = [
+            {"sink_id": "U1", "demand": 1, "level": 1},
+            {"sink_id": "U2", "demand": 1, "level": 2},
+            {"sink_id": "U3", "demand": 1, "level": 2},
+        ]
+        r = self.client.post("/api/delivery/bypass", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        # 写前视图：无待修复故障，旁通安全；拼接视图会误判 FAULT_REWATER_RISK
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["safe"], out)
+        self.assertIsNotNone(out["with_bypass"])
 
 
 if __name__ == "__main__":

@@ -15,8 +15,12 @@
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
 - POST /api/delivery/allocate                          保障等级分档交付核算（只读：按等级总量、再逐点字典序最大化交付）
 - POST /api/delivery/bypass                            临时旁通管评估（只读：基线与内存接入旁通后的分档交付对照，重新进水判不可用）
-- POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性 + 缺报读数可行流量范围）
+- POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性校验 + 缺报读数可行流量范围）
 - POST /api/drill                                      调度演练（只读：按顺序演练一串隔离/复供/水源切换，逐步套用提交校验）
+
+所有只读接口的单次请求都在 REPEATABLE READ READ ONLY 事务中一次取齐
+版本/节点/管段/运行水源/待修复事件，只对应同一已提交状态；并发写入时
+结果只能是写入前或写入后的完整视图。确认类写接口仍锁版本行按最新状态原子复核。
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -212,7 +216,8 @@ def import_network(payload: ImportIn):
 
 @app.get("/api/network", response_model=NetworkOut, tags=["管网"], summary="读取当前管网与版本")
 def get_network():
-    with db.get_conn() as conn:
+    # 版本/节点/管段须对应同一提交时刻：REPEATABLE READ 只读事务一次取齐
+    with db.consistent_read() as conn:
         version, updated_at, nodes, pipes = db.load_snapshot(conn)
     return serialize_snapshot(version, updated_at, nodes, pipes)
 
@@ -227,7 +232,9 @@ def get_network():
     summary="关阀建议：只知道故障管段时，按当前管网计算一套可提交的关阀方案（只读）",
 )
 def recommend_isolation(payload: RecommendIn):
-    with db.get_conn() as conn:
+    # 一次请求只基于同一已提交状态：版本/节点/管段（阀位）/待修复事件
+    # 必须在同一 REPEATABLE READ 快照内取齐，杜绝跨提交拼接误判隔离安全。
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         pending_fault_ids = frozenset(
             e["fault_pipe_id"] for e in db.list_open_events(conn)
@@ -249,7 +256,8 @@ def recommend_isolation(payload: RecommendIn):
     summary="预演：判断能否隔离并计算失供用水点（只读，不改状态）",
 )
 def preview_isolation(payload: PlanIn):
-    with db.get_conn() as conn:
+    # 版本/阀位/待修复事件同一快照取齐；预演只读，沿用既有过期版本不拒绝语义
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         pending_fault_ids = frozenset(
             e["fault_pipe_id"] for e in db.list_open_events(conn)
@@ -340,7 +348,7 @@ def submit_isolation(payload: PlanIn):
 )
 def get_events():
     settings = get_settings()
-    with db.get_conn() as conn:
+    with db.consistent_read() as conn:
         return db.list_events(conn, settings.history_limit)
 
 
@@ -380,7 +388,8 @@ def _load_restore_context(conn, event_id: int, *, for_update: bool = False):
     summary="复供预演：重开该事件阀门后的安全性与预计恢复用水点（只读）",
 )
 def restore_preview(event_id: int, payload: RestoreIn):
-    with db.get_conn() as conn:
+    # 事件行、版本/阀位/其余待修复事件同一快照：复供事件不存在/已复供沿用既有错误
+    with db.consistent_read() as conn:
         version, event, result = _load_restore_context(conn, event_id)
 
     return serialize_restore_preview(version, payload.version, event, result)
@@ -468,7 +477,8 @@ def _switch_response_body(version: int, targets, result, snapshot_id: int | None
     summary="水源停运/恢复预演：失供与恢复用水点、待修复故障重新进水风险（只读）",
 )
 def source_switch_preview(payload: SourceSwitchIn):
-    with db.get_conn() as conn:
+    # 版本/运行水源/阀位/待修复事件同一快照取齐；过期版本沿用 version_match=false
+    with db.consistent_read() as conn:
         version, result, targets = _load_source_switch_context(conn, payload)
 
     return serialize_source_switch_preview(version, payload.version, result)
@@ -528,7 +538,8 @@ def source_switch_confirm(payload: SourceSwitchIn):
     summary="用水点最低流量核算：现有阀位与故障状态下的最大可交付总量（只读）",
 )
 def evaluate_delivery_request(payload: DeliveryEvaluateIn):
-    with db.get_conn() as conn:
+    # 版本/运行水源/阀位/待修复事件同一快照：流量核算全程基于同一已提交状态
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         # 已关闭阀门与待修复故障管段不可通行：阻断口径与既有可达性接口完全一致
         pending_fault_ids = frozenset(
@@ -570,7 +581,8 @@ def evaluate_delivery_request(payload: DeliveryEvaluateIn):
     summary="保障等级分档交付：按等级总量、再逐点字典序最大化各用水点交付（只读）",
 )
 def allocate_delivery_request(payload: DeliveryAllocateIn):
-    with db.get_conn() as conn:
+    # 版本/运行水源/阀位/待修复事件同一快照：分档交付全程基于同一已提交状态
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         # 已关闭阀门与待修复故障管段不可通行：阻断口径与既有可达性接口完全一致
         pending_fault_ids = frozenset(
@@ -615,7 +627,8 @@ def allocate_delivery_request(payload: DeliveryAllocateIn):
     summary="临时旁通管评估：基线与内存接入旁通后的分档交付对照，重新进水风险判不可用（只读）",
 )
 def evaluate_bypass_request(payload: DeliveryBypassIn):
-    with db.get_conn() as conn:
+    # 版本/运行水源/阀位/待修复事件同一快照：基线核算与旁通安全判定基于同一状态
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         # 已关闭阀门与待修复故障管段不可通行：阻断口径与既有可达性接口完全一致
         pending_fault_ids = frozenset(
@@ -682,7 +695,8 @@ def evaluate_bypass_request(payload: DeliveryBypassIn):
     summary="管段流量计读数核对：按当前状态校验一致性，并为缺报管段推断可行流量范围（只读）",
 )
 def reconcile_meter_readings(payload: MeterReconcileIn):
-    with db.get_conn() as conn:
+    # 版本/运行水源/阀位/待修复事件同一快照：读数核对全程基于同一已提交状态
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         # 阻断口径与既有可达性 / 流量核算接口完全一致：已关闭阀门 + 待修复故障管段
         pending_fault_ids = frozenset(
@@ -745,7 +759,8 @@ def list_snapshots(
         default=None, ge=1, description="游标：只返回编号严格大于该值的快照"
     ),
 ):
-    with db.get_conn() as conn:
+    # 历史列表只读：同一快照取齐，并发写入不产生跨时刻拼接
+    with db.consistent_read() as conn:
         rows = db.list_state_snapshots(conn, limit=limit, after_id=after_id)
     return [serialize_snapshot_row(r) for r in rows]
 
@@ -757,7 +772,7 @@ def list_snapshots(
     summary="按编号读取冻结快照：节点、水源运行状态、管段阀位、待修复故障、由运行水源可达的用水点",
 )
 def get_snapshot(snapshot_id: int):
-    with db.get_conn() as conn:
+    with db.consistent_read() as conn:
         row = _get_snapshot_or_404(conn, snapshot_id)
     return serialize_snapshot_row(row)
 
@@ -777,7 +792,8 @@ def diff_snapshot(
         "首条快照无基线时，目标状态全部计为新增。",
     ),
 ):
-    with db.get_conn() as conn:
+    # 目标/基线/相邻判定同一快照取齐，快照只增不改且并发写入不分叉
+    with db.consistent_read() as conn:
         target = _get_snapshot_or_404(conn, snapshot_id)
         if base_id is not None:
             base = db.get_state_snapshot(conn, base_id)
@@ -820,7 +836,7 @@ def diff_snapshot(
     summary="摘要链信息：创世摘要、建链起点、现存/已入链快照范围（只读）",
 )
 def get_audit_chain():
-    with db.get_conn() as conn:
+    with db.consistent_read() as conn:
         info = db.get_chain_info(conn)
     return {
         "genesis_digest": audit.GENESIS_DIGEST,
@@ -852,7 +868,8 @@ def audit_verify(payload: AuditVerifyIn):
             "起点前/终点摘要必须是 64 位十六进制 SHA-256 摘要",
         )
 
-    with db.get_conn() as conn:
+    # 链信息与区间行同一快照取齐：核验区间不会因并发追加读到半新半旧
+    with db.consistent_read() as conn:
         # 端点不存在须明确报错（回滚造成的编号空洞也算不存在）
         if not db.state_snapshot_exists(conn, payload.start_id):
             raise ApiError(
@@ -916,8 +933,10 @@ def _to_domain_drill_steps(payload: DrillIn) -> list[DrillStep]:
     summary="调度演练：以当前状态为起点，按顺序只读演练一串隔离/复供/水源切换操作",
 )
 def drill_operations(payload: DrillIn):
-    # 全程只读：仅读取当前状态，在内存副本上逐步推演，不写版本/阀位/事件/快照
-    with db.get_conn() as conn:
+    # 全程只读：版本/阀位/水源状态/现存事件必须在同一 REPEATABLE READ
+    # 快照内取齐，演练以该提交时刻的完整状态为起点逐步推演；并发写入的
+    # 结果只可能整体可见或整体不可见，绝不跨提交拼接。
+    with db.consistent_read() as conn:
         version, _updated_at, nodes, pipes = db.load_snapshot(conn)
         # 版本过期：返回当前版本并拒绝演练（不执行任何步骤）
         if version != payload.version:

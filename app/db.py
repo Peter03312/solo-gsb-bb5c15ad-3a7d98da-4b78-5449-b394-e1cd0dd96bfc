@@ -162,6 +162,42 @@ def transaction() -> Iterator:
             raise
 
 
+@contextmanager
+def consistent_read() -> Iterator:
+    """只读一致性视图：一次请求内的所有 SELECT 共用同一已提交快照。
+
+    整网重导、隔离提交、复供确认、水源切换等写操作可能在一次只读请求
+    的多条 SELECT 之间提交。连接默认 READ COMMITTED 时每条语句各取一份
+    快照，会把不同提交时刻的版本/阀位/水源状态/待修复事件拼成“混合视图”，
+    进而误判隔离安全或交付量。
+
+    这里把事务显式置为 **REPEATABLE READ READ ONLY**：事务快照在首条
+    SELECT 时固定，之后本请求读到的 network_meta（版本）、nodes（含水源
+    运行状态）、pipes（阀位）、isolation_events（待修复事件）必然对应
+    同一提交时刻；并发写入的结果要么全部可见（写后的完整视图），要么
+    全部不可见（写前的完整视图），绝不出现跨时刻拼接。只读事务不阻塞
+    写操作、也不会发生串行化失败。
+
+    路由层仍在请求结束后依据返回的 version 与客户端已读 version 比对：
+    沿用既有 version_match / VERSION_CONFLICT 过期版本处理，不改变任何
+    接口的输入输出；确认类写操作仍走 transaction() 按最新状态原子复核。
+    """
+    conn = psycopg2.connect(get_settings().database_url)
+    try:
+        # 必须在事务首条语句前设置：REPEATABLE READ 保证整请求同一快照，
+        # READ ONLY 声明本事务不写（PostgreSQL 可据此做只读优化并拒绝误写）。
+        conn.set_session(
+            isolation_level="REPEATABLE READ", readonly=True, autocommit=False
+        )
+        try:
+            yield conn
+        finally:
+            # 纯只读：提交仅用于结束事务释放快照，无任何写入需要持久化
+            conn.rollback()
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
     """启动时建表；等待 PostgreSQL 就绪。
 
